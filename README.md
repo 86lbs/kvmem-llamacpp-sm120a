@@ -102,6 +102,25 @@ curl http://127.0.0.1:18080/stats     # 看换页/命中
 
 浏览器访问 `http://127.0.0.1:18080/` 使用内置 UI。
 
+### 3.4 性能实测：原生 vs KVMem（同一台机、同一模型）
+
+模型 `Qwen3.5-9B-Q4_K_M`，`-c 262144`，长文本中段埋暗号后提问。
+
+| 上下文 | 模式 | prefill 速度 | 耗时 |
+|---|---|---|---|
+| **75K tokens** | 原生 | **2233 tok/s** | 33.9 s |
+| 75K tokens | KVMem | 1799 tok/s | 42.0 s |
+| **252K tokens** | 原生 | 1192–1220 tok/s | 206.6 / 211.4 s |
+| **252K tokens** | **KVMem** | **1707–1804 tok/s** | **139.7 / 147.7 s** |
+
+**结论**
+
+- **上下文还塞得下时（75K）：KVMem 反而慢约 24%** —— 额外的分页/选择开销，没有收益。
+- **上下文超出舒适区时（252K）：KVMem 快 40–50%** —— 活跃窗口被限制在 B=16384，避免全长注意力的二次开销。
+- 暗号检索：两种模式都能命中（原生在 252K 有一次未命中，复测命中 → 属随机波动，不作为结论）。
+
+> 即：**KVMem 的收益随上下文长度增长才出现**。短/中上下文不要开，纯亏。
+
 ---
 
 ## 4. 从源码复现
@@ -187,20 +206,24 @@ cmake --build D:\build\kvmem\build-backends\llamacpp --parallel 16 --target llam
 
 ## 7. 已知限制（实测发现，务必先读）
 
-### 7.1 sm_120a 上 i-quant（IQ2/IQ3）GPU 推理结果错误
+### 7.1 27B 的 2-bit i-quant 在 sm_120 GPU 上结果错误（9B 正常）
 
-在 RTX 5070 Ti Laptop（sm_120）上实测：
+在 RTX 5070 Ti Laptop（sm_120 / 12GB）上逐一实测：
 
-| 配置 | CPU (`-ngl 0`) | GPU (`-ngl 99`) |
-|---|---|---|
-| `Qwen3.8-27B-UD-IQ2_S`（i-quant） | ✅ 正确 | ❌ 输出 `/////` 乱码 |
-| `Qwen3.8-27B-Q4_K_M`（K-quant） | ✅ 正确 | ✅ 正确（含部分卸载 `-ngl 8`） |
-| `Qwen3.5-9B-Q4_K_M`（K-quant） | — | ✅ 正确，长上下文检索正常 |
+| 模型 | 量化 | CPU (`-ngl 0`) | GPU (`-ngl 99`) |
+|---|---|---|---|
+| Qwen3.5-9B | **IQ4_XS**（i-quant） | — | ✅ 正确 |
+| Qwen3.8-27B（unsloth UD） | **IQ2_S** | ✅ 正确（答 `2`） | ❌ 全 `/////` |
+| Qwen3.8-27B（bartowski） | **IQ2_XXS** | ✅ 正确（答 `2`） | ❌ 乱码（`1+ 1+ 1: 7`） |
+| Qwen3.5-9B | Q4_K_M（K-quant） | — | ✅ 正确 |
+| Qwen3.8-27B | Q4_K_M（K-quant） | ✅ 正确 | ✅ 正确 |
 
-**结论**：i-quant 的反量化/矩阵乘 kernel 在该 llama.cpp 基线（`620d2225`）的 sm_120a 编译下不正确。K-quant 不受影响。
+**结论**：不是"i-quant 全坏"，而是 **27B 尺寸 + 2-bit i-quant** 在这个 llama.cpp 基线（`620d2225`）的 sm_120a CUDA 路径上算错；9B 的 i-quant 正常，27B 的 K-quant 也正常。CPU 全部正常 → 是 GPU kernel 问题，不是模型文件损坏。
 
-**影响**：12GB 显存要跑 27B，权重必须 ≤8GB，那就只能用 IQ2/IQ3 —— 恰好踩中这个 bug。
-→ **12GB 卡上建议用 ≤8GB 的 K-quant 模型（如 9B Q4_K_M），或等上游修复后重编。**
+已排除：`120a` vs `120` 架构参数、`GGML_CUDA_FORCE_MMQ`、`GGML_CUDA_DISABLE_GRAPHS`、`-fa off`。
+
+**影响**：12GB 显存跑 27B 必须 ≤8GB 权重 → 只能选 IQ2 → **27B 目前不可用**。
+→ 12GB 卡请用 **9B K-quant**（已验证可用），或等上游修复。
 
 ### 7.2 KVMem 需要 flash attention
 
