@@ -35,7 +35,16 @@ KVMem 官方 v0.19.0-rc1 只发布了 **NInfer 后端**的 Windows 包，llama.c
 | `--list-devices` | ✅ `CUDA0: NVIDIA GeForce RTX 5070 Ti Laptop GPU (12199 MiB, 11042 MiB free)`, compute 12.0 |
 | `--kvmem-capabilities` | ✅ `{"backend":"llamacpp","query_scoring_revision":2,...}` |
 
-> 推理链路需自备模型（见第 5 节），本仓库不附带权重。
+### 端到端推理实测（推荐配置）
+
+| 项 | 值 |
+|---|---|
+| 模型 | `Qwen3.5-9B-Q4_K_M.gguf`（5.3 GB，K-quant） |
+| 启动 | `-c 65536 --kvmem --kvmem-budget 16384 --kvmem-gen-reserve 2048 --kvmem-host-mib 8192 --kvmem-gpu-ratio 0.28 -ngl 99 -fa on` |
+| 简单问答 | ✅ `1+1` → `2` |
+| 长上下文针测试 | ✅ 16039 token prompt，**7.3 秒**处理，准确检索出埋在中间的暗号 `KV-7749` |
+
+> ⚠️ **重要限制见第 9 节**：27B 模型在 12GB 卡上只能靠 i-quant（IQ2/IQ3），而 i-quant 在 sm_120a 的 CUDA 路径上会输出乱码。**K-quant 正常**。
 
 ---
 
@@ -58,17 +67,19 @@ $env:PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin;C:\Pro
 $env:PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64;$env:PATH"
 
 .\llama-kvmem-server.exe `
-  -m 'D:\kvmem\models\Qwen3.8-27B-UD-IQ2_S.gguf' `
-  -c 32768 `
+  -m 'D:\kvmem\models\Qwen3.5-9B-Q4_K_M.gguf' `
+  -c 65536 `
   --kvmem `
-  --kvmem-budget 8192 `
-  --kvmem-gen-reserve 1024 `
+  --kvmem-budget 16384 `
+  --kvmem-gen-reserve 2048 `
   --kvmem-host-mib 8192 `
-  --kvmem-gpu-ratio 0.30 `
+  --kvmem-gpu-ratio 0.28 `
   -ngl 99 -fa on `
   --kv-dtype q8_0 `
   --port 18080
 ```
+
+> 这是**已实测通过**的配置（9B K-quant，16K 上下文针测试 7.3 秒准确命中）。27B 在 12GB 上请先读第 7 节。
 
 **关键参数说明**
 
@@ -166,14 +177,49 @@ cmake --build D:\build\kvmem\build-backends\llamacpp --parallel 16 --target llam
 
 | 模型 | 权重 | 12GB 可用性 |
 |---|---|---|
-| Qwen3.8-27B `UD-IQ2_S` | 7.8 GB | ✅ 推荐（unsloth 动态量化） |
-| Qwen3.8-27B `UD-IQ2_XXS` | 6.8 GB | ✅ 更保守 |
+| **Qwen3.5-9B `Q4_K_M`** | **5.3 GB** | ✅ **实测可用（推荐）** |
+| Qwen3.8-27B `UD-IQ2_S` | 7.8 GB | ❌ 见第 7 节：i-quant GPU 输出乱码 |
 | Qwen3.8-27B `Q4_K_M` | 17.7 GB | ❌ 装不下，KVMem 也无解 |
-| Qwen3.5 9B / 4B | 4–7 GB | ✅ 验证链路首选 |
+
+> 选择原则：**先保证是 K-quant，再保证 ≤8GB**。两条同时满足，12GB 卡才有可用组合。
 
 ---
 
-## 7. 许可证与声明
+## 7. 已知限制（实测发现，务必先读）
+
+### 7.1 sm_120a 上 i-quant（IQ2/IQ3）GPU 推理结果错误
+
+在 RTX 5070 Ti Laptop（sm_120）上实测：
+
+| 配置 | CPU (`-ngl 0`) | GPU (`-ngl 99`) |
+|---|---|---|
+| `Qwen3.8-27B-UD-IQ2_S`（i-quant） | ✅ 正确 | ❌ 输出 `/////` 乱码 |
+| `Qwen3.8-27B-Q4_K_M`（K-quant） | ✅ 正确 | ✅ 正确（含部分卸载 `-ngl 8`） |
+| `Qwen3.5-9B-Q4_K_M`（K-quant） | — | ✅ 正确，长上下文检索正常 |
+
+**结论**：i-quant 的反量化/矩阵乘 kernel 在该 llama.cpp 基线（`620d2225`）的 sm_120a 编译下不正确。K-quant 不受影响。
+
+**影响**：12GB 显存要跑 27B，权重必须 ≤8GB，那就只能用 IQ2/IQ3 —— 恰好踩中这个 bug。
+→ **12GB 卡上建议用 ≤8GB 的 K-quant 模型（如 9B Q4_K_M），或等上游修复后重编。**
+
+### 7.2 KVMem 需要 flash attention
+
+`-fa off` 与 KVMem 不兼容，报错：
+`KVMEM retained histories require supported host KV switching (flash attention on)`
+且量化 V cache（`--kv-dtype q8_0`）本身也要求 `-fa on`。
+
+### 7.3 已验证可用 / 不可用清单
+
+| 组合 | 状态 |
+|---|---|
+| 9B / K-quant / GPU 全量 / KVMem / `-fa on` | ✅ 可用（推荐） |
+| 27B / Q4_K_M / 部分卸载 / 无 KVMem | ✅ 正确但慢、且放不下 12GB |
+| 27B / IQ2_I / GPU 全量 | ❌ 结果错误 |
+| 任意 / `-fa off` + KVMem | ❌ 不支持 |
+
+---
+
+## 8. 许可证与声明
 
 | 组件 | 许可证 |
 |---|---|
@@ -186,7 +232,7 @@ cmake --build D:\build\kvmem\build-backends\llamacpp --parallel 16 --target llam
 
 ---
 
-## 8. AI 生成声明
+## 9. AI 生成声明
 
 本项目（含构建脚本、文档与预编译产物）由 **AI 智能体自动生成与验证**：
 
