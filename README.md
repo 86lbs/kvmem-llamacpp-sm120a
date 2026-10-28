@@ -9,6 +9,24 @@ KVMem 官方 v0.19.0-rc1 只发布了 **NInfer 后端**的 Windows 包，llama.c
 
 ---
 
+## 0. 两条路线怎么选（先说结论）
+
+KVMem 有两条可走的路，**实测结论差别巨大**：
+
+| | **路线 A：NInfer（推荐）** | 路线 B：llama.cpp（本仓库二进制） |
+|---|---|---|
+| 27B 模型在 12GB 卡 | ✅ **可用**（204K 上下文实测） | ❌ 完全不可用（2-bit kernel 错误） |
+| 模型格式 | `.ninfer`（官方/社区已量化好） | `.gguf` |
+| 现成包 | 官方 v0.19.0-rc1 直发 RTX 50 包 | 需自编（本仓库产物） |
+| 适用场景 | **27B 及以上、要长上下文** | ≤9B 小模型、想用现成 GGUF |
+
+**一句话**：要跑 27B，走 NInfer；只有 ≤9B 的小模型才考虑 llama.cpp。
+路线 A 的完整实测见[第 8 节](#8-ninfer-路线实测27b-在-12gb-上跑通)。
+
+---
+
+---
+
 ## 1. 这是什么
 
 | 项 | 值 |
@@ -242,7 +260,61 @@ cmake --build D:\build\kvmem\build-backends\llamacpp --parallel 16 --target llam
 
 ---
 
-## 8. 许可证与声明
+## 8. NInfer 路线实测（27B 在 12GB 上跑通）
+
+llama.cpp 路线在 27B 上撞死（第 7 节），但**官方 NInfer 路线完全可行**。
+
+### 8.1 组成
+
+| 项 | 内容 |
+|---|---|
+| 运行包 | `kvmem-v0.19.0-rc1-ninfer-windows-rtx50-sm120a.zip`（940 MB，[官方 Release](https://github.com/kvmem/kvmem/releases/tag/v0.19.0-rc1)） |
+| worker | `ninfer-serve 0.12.0-rtx3090+63428ac2` |
+| 模型 | `Ternary-Bonsai-2-27B-ninfer-v3.ninfer`（8.87 GB，三元量化 t2_g128） |
+| 模型来源 | HF `WaveCut/Ternary-Bonsai-2-27B-NInfer-v3`（官方推荐的 IQ3_S 版是 13.13 GB，12GB 卡装不下） |
+
+> 关键点：**8.87 GB 权重 + KVMem 分级 = 12GB 卡能跑 27B**。官方推荐的 IQ3_S（13.13GB）超出 12GB，故改用三元量化版。
+
+### 8.2 启动
+
+```powershell
+$app = 'D:\kvmem\ninfer-pkg\app\kvmem-v0.19.0-rc1-ninfer-windows-rtx50-sm120a'
+& "$app\workers\ninfer\ninfer-kvmem-server.exe" `
+  'D:\kvmem\models\Ternary-Bonsai-2-27B-ninfer-v3.ninfer' `
+  --device 0 --max-context 204800 `
+  --kvmem --kvmem-budget 2048 --kvmem-gen-reserve 512 --kvmem-host-mib 16000 `
+  --port 18200
+```
+
+或直接：`D:\kvmem\start-ninfer.ps1`
+
+### 8.3 实测数据（RTX 5070 Ti Laptop 12GB）
+
+| 上下文 | 耗时 | prefill | decode | 检索 |
+|---|---|---|---|---|
+| 47.7K | 57 s | 857 tok/s | 51 tok/s | ✅ 单针命中 |
+| 74.9K（3 针） | 92 s | 848 tok/s | — | ✅ **3/3 全中** |
+| 122.5K | 140 s | 887 tok/s | 44 tok/s | ✅ 命中 |
+| **204.1K**（上限） | 234 s | 883 tok/s | 43 tok/s | ✅ 命中 |
+
+- 加载：权重 **6.70 GiB**（三元压缩后），GPU KV 池 2560 token（B+R），剩余 3.55 GiB
+- 204K 时：host payload **12.5 GB** / 预算 15.6 GB，换页 396 次，累计换入 49.5 GB
+- 逻辑推理：鸡兔同笼（10 头 28 脚）→ 正确答出鸡 6 兔 4
+
+### 8.4 与 llama.cpp 路线对比
+
+| 指标 | NInfer（27B 三元） | llama.cpp（9B Q4） |
+|---|---|---|
+| 模型规模 | **27B** | 9B |
+| decode | 43–54 tok/s | 44 tok/s |
+| 最大上下文 | **204K** | 252K（但 KVMem 收益才显现） |
+| 12GB 可行性 | ✅ | ✅ |
+
+> 27B 在同等速度下带来更强能力，**这就是选 NInfer 的理由**。
+
+---
+
+## 9. 许可证与声明
 
 | 组件 | 许可证 |
 |---|---|
@@ -255,7 +327,7 @@ cmake --build D:\build\kvmem\build-backends\llamacpp --parallel 16 --target llam
 
 ---
 
-## 9. AI 生成声明
+## 10. AI 生成声明
 
 本项目（含构建脚本、文档与预编译产物）由 **AI 智能体自动生成与验证**：
 
